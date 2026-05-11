@@ -7,14 +7,11 @@ import android.app.Service
 import android.content.Intent
 import android.media.AudioFormat
 import android.media.AudioRecord
-import android.media.MediaRecorder
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
+import android.os.Build
 import android.os.IBinder
 import android.util.Log
-import java.net.DatagramPacket
-import java.net.DatagramSocket
-import java.net.InetAddress
 
 class AudioCaptureService : Service() {
 
@@ -23,26 +20,34 @@ class AudioCaptureService : Service() {
         const val SAMPLE_RATE = 48000
         const val CHANNELS = 2
         const val BUFFER_SIZE = 4096
-        var targetPort: Int = 0
         var targetHost: String = ""
+        var targetPort: Int = 19090
+        var currentDeviceName: String = ""
         var isRunning = false
+        private const val TAG = "AudioCast.audio"
     }
 
     private var audioRecord: AudioRecord? = null
-    private var udpSocket: DatagramSocket? = null
+    private var audioEngine: AudioEngine? = null
     private var captureThread: Thread? = null
 
     override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
-        startForeground(1, createNotification())
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             "START_CAPTURE" -> {
                 val code = intent.getIntExtra("resultCode", -1)
-                val data = intent.getParcelableExtra<Intent>("data")
+                val data = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    intent.getParcelableExtra("data", Intent::class.java)
+                } else {
+                    @Suppress("DEPRECATION")
+                    intent.getParcelableExtra("data")
+                }
+                currentDeviceName = intent.getStringExtra("deviceName") ?: ""
+                startForeground(1, createNotification("正在连接 $currentDeviceName..."))
                 if (code != -1 && data != null) {
                     startCapture(code, data)
                 }
@@ -62,38 +67,52 @@ class AudioCaptureService : Service() {
             .setChannelMask(AudioFormat.CHANNEL_IN_STEREO)
             .build()
 
-        val playbackConfig = android.media.PlaybackCaptureConfiguration.Builder(
-            mediaProjection
-        )
+        val playbackConfig = android.media.PlaybackCaptureConfiguration.Builder(mediaProjection)
             .addMatchingUsage(android.media.AudioAttributes.USAGE_MEDIA)
             .addMatchingUsage(android.media.AudioAttributes.USAGE_GAME)
             .build()
 
-        val audioRecord = AudioRecord.Builder()
+        val record = AudioRecord.Builder()
             .setAudioPlaybackCaptureConfig(playbackConfig)
             .setAudioFormat(audioFormat)
             .setBufferSizeInBytes(BUFFER_SIZE)
             .build()
 
-        this.audioRecord = audioRecord
-        isRunning = true
-        audioRecord.startRecording()
+        this.audioRecord = record
 
-        udpSocket = DatagramSocket()
-        val targetAddress = InetAddress.getByName(targetHost)
+        // TCP handshake on a background thread
+        Thread {
+            try {
+                val handshake = TcpHandshakeClient(targetHost, 19090).connect()
+                Log.d(TAG, "Handshake OK: udpPort=${handshake.udpPort}, token=${handshake.token}")
 
-        captureThread = Thread {
-            val buffer = ByteArray(BUFFER_SIZE)
-            while (isRunning) {
-                val bytesRead = audioRecord.read(buffer, 0, buffer.size)
-                if (bytesRead > 0) {
-                    try {
-                        val packet = DatagramPacket(buffer, bytesRead, targetAddress, targetPort)
-                        udpSocket?.send(packet)
-                    } catch (e: Exception) {
-                        Log.e("AudioCapture", "UDP send error", e)
-                    }
+                val engine = AudioEngine(targetHost, handshake.udpPort)
+                if (!engine.start()) {
+                    Log.e(TAG, "Failed to start native engine")
+                    stopCapture()
+                    return@Thread
                 }
+                this.audioEngine = engine
+                isRunning = true
+
+                record.startRecording()
+
+                captureThread = Thread {
+                    val buffer = ShortArray(BUFFER_SIZE / 2)
+                    while (isRunning) {
+                        val samplesRead = record.read(buffer, 0, buffer.size)
+                        if (samplesRead > 0) {
+                            engine.pushPCM(buffer, System.currentTimeMillis())
+                        }
+                    }
+                }.apply { start() }
+
+                updateNotification("音频流转中 - $currentDeviceName")
+                Log.d(TAG, "Capture started, sending to ${targetHost}:${handshake.udpPort}")
+
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to start streaming", e)
+                stopCapture()
             }
         }.apply { start() }
     }
@@ -101,12 +120,20 @@ class AudioCaptureService : Service() {
     private fun stopCapture() {
         isRunning = false
         captureThread?.join(1000)
-        audioRecord?.stop()
+        captureThread = null
+
+        try {
+            audioRecord?.stop()
+        } catch (_: Exception) {}
         audioRecord?.release()
         audioRecord = null
-        udpSocket?.close()
-        udpSocket = null
+
+        audioEngine?.stop()
+        audioEngine = null
+
+        stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
+        Log.d(TAG, "Capture stopped")
     }
 
     private fun createNotificationChannel() {
@@ -121,13 +148,18 @@ class AudioCaptureService : Service() {
         manager.createNotificationChannel(channel)
     }
 
-    private fun createNotification(): Notification {
+    private fun createNotification(text: String): Notification {
         return Notification.Builder(this, CHANNEL_ID)
             .setContentTitle("AudioCast")
-            .setContentText("音频正在转发到桌面端")
+            .setContentText(text)
             .setSmallIcon(android.R.drawable.ic_media_play)
             .setOngoing(true)
             .build()
+    }
+
+    private fun updateNotification(text: String) {
+        val manager = getSystemService(NotificationManager::class.java)
+        manager.notify(1, createNotification(text))
     }
 
     override fun onBind(intent: Intent?): IBinder? = null

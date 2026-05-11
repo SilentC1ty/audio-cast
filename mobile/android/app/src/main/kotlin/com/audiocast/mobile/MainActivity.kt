@@ -8,6 +8,7 @@ import android.util.Log
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
+import org.json.JSONObject
 
 class MainActivity : FlutterActivity() {
     private val CHANNEL = "com.audiocast/audio"
@@ -27,13 +28,18 @@ class MainActivity : FlutterActivity() {
                 }
                 "startStreaming" -> {
                     val host = call.argument<String>("host") ?: ""
-                    val port = call.argument<Int>("port") ?: 9999
-                    startAudioCapture(host, port)
+                    val port = call.argument<Int>("port") ?: 19090
+                    val deviceName = call.argument<String>("deviceName") ?: ""
+                    startAudioCapture(host, port, deviceName)
                     result.success(true)
                 }
                 "stopStreaming" -> {
                     stopAudioCapture()
                     result.success(true)
+                }
+                "getStatistics" -> {
+                    val stats = getStatistics()
+                    result.success(stats)
                 }
                 else -> result.notImplemented()
             }
@@ -41,13 +47,9 @@ class MainActivity : FlutterActivity() {
     }
 
     private fun requestCapturePermission() {
+        if (pendingResultCode != -1 && pendingIntent != null) return
         val manager = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-        val intent = manager.createScreenCaptureIntent()
-        // 如果已经有过授权，直接启动服务
-        if (pendingResultCode != -1 && pendingIntent != null) {
-            return
-        }
-        startActivityForResult(intent, REQUEST_CODE_CAPTURE)
+        startActivityForResult(manager.createScreenCaptureIntent(), REQUEST_CODE_CAPTURE)
     }
 
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
@@ -56,12 +58,12 @@ class MainActivity : FlutterActivity() {
             if (resultCode == Activity.RESULT_OK && data != null) {
                 pendingResultCode = resultCode
                 pendingIntent = data
-                Log.d("AudioCast", "MediaProjection permission granted")
+                Log.d(TAG, "MediaProjection permission granted")
             }
         }
     }
 
-    private fun startAudioCapture(host: String, port: Int) {
+    private fun startAudioCapture(host: String, port: Int, deviceName: String = "") {
         if (pendingResultCode == -1 || pendingIntent == null) {
             requestCapturePermission()
             return
@@ -74,6 +76,7 @@ class MainActivity : FlutterActivity() {
             action = "START_CAPTURE"
             putExtra("resultCode", pendingResultCode)
             putExtra("data", pendingIntent)
+            putExtra("deviceName", deviceName)
         }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             startForegroundService(intent)
@@ -83,9 +86,19 @@ class MainActivity : FlutterActivity() {
     }
 
     private fun stopAudioCapture() {
-        val intent = Intent(this, AudioCaptureService::class.java).apply {
+        startService(Intent(this, AudioCaptureService::class.java).apply {
             action = "STOP_CAPTURE"
-        }
-        startService(intent)
+        })
+    }
+
+    private fun getStatistics(): Map<String, Any> {
+        val stats = mutableMapOf<String, Any>()
+        stats["latency"] = 0
+        stats["packetLoss"] = 0.0
+        return stats
+    }
+
+    companion object {
+        private const val TAG = "AudioCast.system"
     }
 }
